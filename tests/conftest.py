@@ -35,6 +35,8 @@ def make_settings(tmp_path) -> Settings:
         max_retries=10,
         retry_backoff_base=0.01,
         retry_backoff_max=0.05,
+        index_batch_size=50,
+        index_poll_timeout=0.02,
     )
 
 
@@ -65,6 +67,35 @@ def produce_raw(partition: int, key: str, payload: dict) -> None:
     p.begin_transaction()
     p.produce(RAW, partition, json.dumps(payload).encode(), key.encode())
     p.commit_transaction()
+
+
+def produce_clean(partition: int, payload: dict, key: str | None = None) -> None:
+    """Commit one well-formed clean record directly to the clean topic."""
+    import json
+
+    key = key or payload.get("box_id", "K")
+    p = Producer({"bootstrap.servers": "fake",
+                  "transactional.id": f"clean-seed-{partition}-{key}-{os.urandom(3).hex()}"})
+    p.init_transactions()
+    p.begin_transaction()
+    p.produce(CLEAN, partition,
+              json.dumps(payload, ensure_ascii=False).encode(), key.encode())
+    p.commit_transaction()
+
+
+def clean_record(box_id: str, sampled_utc: str, celsius: float,
+                 partition: int, source_offset: int,
+                 reading: float | None = None, scale: str = "C") -> dict:
+    return {
+        "box_id": box_id,
+        "sampled_utc": sampled_utc,
+        "reading": celsius if reading is None else reading,
+        "scale": scale,
+        "celsius": celsius,
+        "source_topic": RAW,
+        "source_partition": partition,
+        "source_offset": source_offset,
+    }
 
 
 def drain_clean(partition: int | None = None) -> list[dict]:

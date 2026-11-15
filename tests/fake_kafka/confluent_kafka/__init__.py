@@ -19,6 +19,7 @@ from typing import Any
 
 class KafkaError:
     _PARTITION_EOF = -191
+    OFFSET_OUT_OF_RANGE = 1
     UNKNOWN = -1
 
     def __init__(self, code: int, reason: str = "") -> None:
@@ -26,7 +27,11 @@ class KafkaError:
         self.reason = reason
 
     def name(self) -> str:
-        return "PARTITION_EOF" if self.code == self._PARTITION_EOF else "ERROR"
+        if self.code == self._PARTITION_EOF:
+            return "PARTITION_EOF"
+        if self.code == self.OFFSET_OUT_OF_RANGE:
+            return "OFFSET_OUT_OF_RANGE"
+        return "ERROR"
 
     def __str__(self) -> str:
         return self.reason or self.name()
@@ -80,6 +85,8 @@ class _Topic:
     def __post_init__(self) -> None:
         self.log = {p: [] for p in range(self.partitions)}
         self.high_watermark = {p: 0 for p in range(self.partitions)}
+        # Retention boundary per partition: offsets below it are deleted.
+        self.low_watermark = {p: 0 for p in range(self.partitions)}
 
 
 class Broker:
@@ -143,6 +150,10 @@ class Broker:
             t = self.topics.get(topic)
             if t is None:
                 return None
+            if offset < t.low_watermark[partition]:
+                # Retention deleted this offset: signal out-of-range rather
+                # than silently returning another record.
+                return "OUT_OF_RANGE"
             if offset >= len(t.log[partition]):
                 return None
             rec = t.log[partition][offset]
@@ -153,6 +164,20 @@ class Broker:
     def end_offset(self, topic: str, partition: int) -> int:
         with self.lock:
             return len(self.topics[topic].log[partition])
+
+    def low_offset(self, topic: str, partition: int) -> int:
+        with self.lock:
+            return self.topics[topic].low_watermark[partition]
+
+    def delete_records(self, topic: str, partition: int,
+                       before_offset: int) -> None:
+        """Simulate retention: delete every offset below ``before_offset``."""
+        with self.lock:
+            t = self.topics[topic]
+            before_offset = min(before_offset, len(t.log[partition]))
+            t.low_watermark[partition] = max(
+                t.low_watermark[partition], before_offset
+            )
 
     def get_committed(self, group: str, topic: str, partition: int) -> int:
         with self.lock:
@@ -215,6 +240,12 @@ class Consumer:
     def assign(self, tps: list[TopicPartition]) -> None:
         self.assigned = list(tps)
         self.subscriptions = sorted({tp.topic for tp in tps})
+        # Honour explicit seek positions (the indexer assigns concrete
+        # offsets).  Only valid offsets (>= 0) seed the stored position;
+        # OFFSET_INVALID (-1001) falls back to earliest/committed semantics.
+        for tp in tps:
+            if tp.offset >= 0:
+                self.stored[(tp.topic, tp.partition)] = tp.offset
 
     def assignment(self) -> list[TopicPartition]:
         return list(self.assigned)
@@ -255,6 +286,13 @@ class Consumer:
                                self.read_committed, max_epoch)
             if rec is None:
                 continue
+            if rec == "OUT_OF_RANGE":
+                return _FakeMsg(
+                    None,
+                    KafkaError(KafkaError.OFFSET_OUT_OF_RANGE,
+                               f"offset {pos} deleted by retention"),
+                    topic=tp.topic, partition=tp.partition, offset=pos,
+                )
             if self.auto_store:
                 self.stored[(tp.topic, tp.partition)] = pos + 1
             return _FakeMsg(rec)
@@ -296,7 +334,8 @@ class Consumer:
         t = BROKER.topics.get(tp.topic)
         if t is None:
             return (0, 0)
-        return (0, BROKER.end_offset(tp.topic, tp.partition))
+        return (BROKER.low_offset(tp.topic, tp.partition),
+                BROKER.end_offset(tp.topic, tp.partition))
 
     def close(self) -> None:
         self.closed = True

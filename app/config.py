@@ -28,6 +28,10 @@ class Settings:
     retry_backoff_base: float = float(os.environ.get("RETRY_BACKOFF_BASE", "0.2"))
     retry_backoff_max: float = float(os.environ.get("RETRY_BACKOFF_MAX", "5.0"))
     sqlite_path: str = os.environ.get("SQLITE_PATH", "/data/coldchain.db")
+    # Manual incremental indexing: at most this many committed records are
+    # copied out of each clean partition per POST /index/run trigger.
+    index_batch_size: int = _int("INDEX_BATCH_SIZE", 50)
+    index_poll_timeout: float = float(os.environ.get("INDEX_POLL_TIMEOUT", "0.5"))
     # When False the correction stays durable but the partition only resumes
     # via POST /demo/resume/{partition}; used for deterministic crash demos.
     auto_resume: bool = os.environ.get("AUTO_RESUME", "1") not in ("0", "false", "False")

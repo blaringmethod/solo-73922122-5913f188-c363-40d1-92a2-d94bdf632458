@@ -51,6 +51,10 @@ services:
       SQLITE_PATH: /data/coldchain.db
       GROUP_ID: coldchain-worker
       TRANSACTIONAL_ID: coldchain-txn-1
+      # Manual incremental indexing: at most 50 committed clean records per
+      # partition per POST /index/run trigger.
+      INDEX_BATCH_SIZE: "50"
+      INDEX_POLL_TIMEOUT: "0.5"
       # Corrections stay durable but partitions resume via POST /demo/resume,
       # giving the crash demo a deterministic arming window.
       AUTO_RESUME: "0"

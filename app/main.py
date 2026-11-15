@@ -1,4 +1,4 @@
-"""FastAPI application: blocker inspection, correction and clean reads.
+"""FastAPI application: blocker inspection, correction, clean reads and index.
 
 Endpoints (all visible in /docs):
 
@@ -7,6 +7,9 @@ Endpoints (all visible in /docs):
 * ``POST /blocked/{partition}/{offset}/correct`` - durable C/F correction
 * ``GET  /clean``                        - read committed clean records
 * ``GET  /progress``                     - committed source offsets per partition
+* ``POST /index/run``                    - manual incremental indexing pass
+* ``GET  /index/progress``               - durable index cursors and open issues
+* ``GET  /readings/query``               - box + UTC range query (completeness-checked)
 * ``POST /demo/crash``                   - arm a controlled pre/post-commit exit
 * ``GET  /demo/crash``                   - inspect the armed crash point
 """
@@ -22,6 +25,8 @@ from .clean_reader import read_clean
 from .config import Settings, settings as default_settings
 from .crash import CrashController
 from .db import CorrectionStore
+from .index_store import IndexStore
+from .indexer import IncrementalIndexer, IndexerBusyError
 from .models import (
     BlockedMessage,
     CleanReading,
@@ -29,7 +34,13 @@ from .models import (
     CorrectionResponse,
     CrashRequest,
     CrashResponse,
+    IndexProgressResponse,
+    IndexRunResponse,
+    QueryResponse,
 )
+from . import query as query_service
+from .query import query_readings
+from .timestamps import parse_query_instant
 from .worker import Worker
 
 logger = logging.getLogger("coldchain.api")
@@ -43,8 +54,10 @@ class AppState:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.store = CorrectionStore(settings.sqlite_path)
+        self.index_store = IndexStore(settings.sqlite_path)
         self.crash = CrashController(settings.crash_on)
         self.worker = Worker(settings, self.store, self.crash)
+        self.indexer = IncrementalIndexer(settings, self.index_store)
 
 
 def build_app(state: AppState | None = None) -> FastAPI:
@@ -62,6 +75,7 @@ def build_app(state: AppState | None = None) -> FastAPI:
             yield
         finally:
             state.worker.stop()
+            state.index_store.close()
             state.store.close()
 
     app = FastAPI(
@@ -210,6 +224,85 @@ def build_app(state: AppState | None = None) -> FastAPI:
                 for tp in committed
             ],
         }
+
+    # ------------------------------------------------------------- indexing
+    @app.post("/index/run", response_model=IndexRunResponse, tags=["index"])
+    def run_index(d: AppState = Depends(deps)) -> IndexRunResponse:
+        """Run one bounded incremental indexing pass (max 50/partition).
+
+        Reads only transaction-committed clean records (``read_committed``)
+        and persists each reading together with the partition continuation
+        position.  Safe to interrupt, restart and re-trigger: cursors only
+        advance in the same transaction as the row insert, so nothing is
+        skipped or recorded twice.
+        """
+        try:
+            report = d.indexer.run_once()
+        except IndexerBusyError as exc:
+            raise HTTPException(409, str(exc))
+        return IndexRunResponse(**report)
+
+    @app.get("/index/progress", response_model=IndexProgressResponse,
+             tags=["index"])
+    def index_progress(d: AppState = Depends(deps)) -> IndexProgressResponse:
+        """Durable index cursors, per partition, plus every open issue."""
+        cursors = d.index_store.list_cursors(d.settings.clean_topic)
+        return IndexProgressResponse(
+            clean_topic=d.settings.clean_topic,
+            indexed_total=d.index_store.count_readings(d.settings.clean_topic),
+            partitions=[
+                {
+                    "partition": row["partition_no"],
+                    "next_offset": row["next_offset"],
+                    "status": row["status"],
+                    "high_watermark": row["high_watermark"],
+                }
+                for row in cursors
+            ],
+            open_issues=d.index_store.open_issues(d.settings.clean_topic),
+        )
+
+    @app.get("/readings/query", response_model=QueryResponse, tags=["index"])
+    def readings_query(
+        box_id: str = Query(..., min_length=1, description="Exact box identifier"),
+        start_utc: str = Query(
+            ..., alias="start_utc",
+            description="Inclusive UTC start, ISO-8601 with Z or offset",
+        ),
+        end_utc: str = Query(
+            ..., alias="end_utc",
+            description="Inclusive UTC end, ISO-8601 with Z or offset",
+        ),
+        limit: int | None = Query(None, ge=1, le=10_000),
+        d: AppState = Depends(deps),
+    ) -> QueryResponse:
+        """Find indexed readings for one box inside a UTC window.
+
+        The readable boundary of both partitions is fixed when the query
+        starts.  ``status=incomplete`` (with locatable progress/issues) is
+        returned whenever the index has not caught up, retention deleted
+        unindexed records, a read failed, or a matching record's sample time
+        could not be parsed - partial rows are still included but never
+        reported as the complete answer.
+        """
+        try:
+            start_dt = parse_query_instant(start_utc)
+            end_dt = parse_query_instant(end_utc)
+        except ValueError as exc:
+            raise HTTPException(
+                422,
+                f"invalid UTC instant (use ISO-8601 with Z or offset): {exc}",
+            )
+        if end_dt < start_dt:
+            raise HTTPException(422, "end_utc must not be earlier than start_utc")
+
+        boundary = query_service.snapshot_boundaries(d.settings)
+        result = query_readings(
+            d.settings, d.index_store, box_id,
+            start_dt.timestamp(), end_dt.timestamp(), limit,
+            boundary=boundary,
+        )
+        return QueryResponse(**result)
 
     @app.post("/demo/resume/{partition}", tags=["demo"])
     def demo_resume(partition: int, d: AppState = Depends(deps)) -> dict:
