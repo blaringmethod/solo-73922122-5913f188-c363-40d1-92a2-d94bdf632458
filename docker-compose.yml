@@ -1,0 +1,88 @@
+name: coldchain-correction
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: coldchain-redpanda
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092,OUTSIDE://localhost:19092
+      - --set=redpanda.auto_create_topics_enabled=false
+    ports:
+      - "19092:19092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "info", "--api-urls", "http://localhost:9644"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  console:
+    image: redpandadata/console:v2.7.2
+    container_name: coldchain-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8080:8080"
+
+  api:
+    build: .
+    container_name: coldchain-api
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092
+      RAW_TOPIC: raw-readings
+      CLEAN_TOPIC: clean-readings
+      TOPIC_PARTITIONS: "2"
+      SQLITE_PATH: /data/coldchain.db
+      GROUP_ID: coldchain-worker
+      TRANSACTIONAL_ID: coldchain-txn-1
+      # Corrections stay durable but partitions resume via POST /demo/resume,
+      # giving the crash demo a deterministic arming window.
+      AUTO_RESUME: "0"
+      # restart policy stays "no": the demo relies on observing a real process
+      # exit; the demo script brings the container back explicitly.
+    ports:
+      - "8000:8000"
+    volumes:
+      - api-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-off seeding job: `docker compose run --rm seed`
+  seed:
+    build: .
+    container_name: coldchain-seed
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["python", "-m", "scripts.seed"]
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092
+      RAW_TOPIC: raw-readings
+      CLEAN_TOPIC: clean-readings
+      TOPIC_PARTITIONS: "2"
+      AUTO_RESUME: "0"
+    profiles: ["seed"]
+
+volumes:
+  redpanda-data:
+  api-data:
